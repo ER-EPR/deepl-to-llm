@@ -19,15 +19,26 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 @app.post("/translate")
 async def translate_to_llm(request: Request, token: str = Depends(verify_token) if BRIDGE_TOKEN else None):
-    # 解析 Collabora 发来的 form-data 数据
-    data = await request.form()
-    text = data.get("text")
+    # 1. 动态判断请求的 Content-Type
+    content_type = request.headers.get("content-type", "")
+    
+    if "application/json" in content_type:
+        data = await request.json()
+    else:
+        # 兼容 Collabora 传统的 x-www-form-urlencoded
+        data = await request.form()
+        
+    # 2. 提取数据
+    text_data = data.get("text")
     target_lang = data.get("target_lang", "ZH")
 
-    if not text:
+    if not text_data:
         raise HTTPException(status_code=400, detail="Missing text parameter")
 
-    # 构造发给大模型的 Prompt
+    # 3. 兼容 DeepL API 规范（text 有可能是一个数组 ["Hello", "World"]）
+    text = text_data[0] if isinstance(text_data, list) else text_data
+
+    # ---------------- 构造发给大模型的 Prompt ----------------
     llm_payload = {
         "model": LLM_MODEL,
         "messages": [
@@ -49,7 +60,6 @@ async def translate_to_llm(request: Request, token: str = Depends(verify_token) 
             return {"translations": [{"detected_source_language": "EN", "text": result}]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/")
 def health_check():
     return {"status": "LLM to DeepL Bridge is running"}
