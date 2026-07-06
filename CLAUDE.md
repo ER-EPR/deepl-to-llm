@@ -36,12 +36,12 @@ There is no linter or formatter configured. The OpenAPI docs at `/docs` (Swagger
 
 ## Configuration
 
-All config is via env vars read at import time in `main.py` (module-level constants — changing them requires a restart):
+All config is via env vars read at import time in `main.py` (module-level constants — changing them requires a restart). **All must be set in docker-compose; the in-code defaults are placeholders only and will not work against a real LLM.**
 
-- `LLM_API_URL` — upstream chat-completions URL (default points at `example.com`).
-- `LLM_API_KEY` — bearer token sent to the LLM. If unset/empty, no `Authorization` header is sent.
-- `LLM_MODEL` — model name passed in the payload (default `prx.free`).
-- `BRIDGE_TOKEN` — token clients must present to use this bridge. If empty, auth is **disabled** (the `verify_token` dependency returns early). The default is a hardcoded value (`<your-bridge-token>`) — override in production.
+- `LLM_API_URL` — upstream chat-completions URL (default is a placeholder `https://example.com/...`).
+- `LLM_API_KEY` — bearer token sent to the LLM. Default empty; if empty, no `Authorization` header is sent.
+- `LLM_MODEL` — model name passed in the payload. Default empty.
+- `BRIDGE_TOKEN` — token clients must present to use this bridge. **If left empty, auth is disabled** (the `verify_token` dependency returns early, so anyone can hit `/translate`). Always set it in production.
 - `LLM_TIMEOUT` — seconds for the LLM HTTP call (default `9.0`). Collabora's libcurl client uses ~10s; staying under it prevents Collabora from timing out mid-paragraph and leaving text untranslated.
 
 ## Architecture

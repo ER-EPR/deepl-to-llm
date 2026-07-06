@@ -26,12 +26,16 @@ import bridge
 app = FastAPI()
 
 # Config is read at import time (module-level constants -> restart to change).
+# All of these MUST be set via environment variables (e.g. in docker-compose);
+# the defaults below are placeholders only and will not work against a real LLM.
 LLM_API_URL = os.getenv(
     "LLM_API_URL", "https://example.com/v1/chat/completions"
 )
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-xxx")
-LLM_MODEL = os.getenv("LLM_MODEL", "prx.free")
-BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "<your-bridge-token>")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+# BRIDGE_TOKEN gates /translate. If left empty, auth is DISABLED (anyone can
+# use the endpoint) — always set it in production.
+BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "")
 
 # Collabora's libcurl client uses ~10s. Stay under it so the bridge responds
 # before Collabora times out and leaves a paragraph untranslated/empty.
