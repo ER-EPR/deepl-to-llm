@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local secrets / env files — never commit credentials
+.env
+.env.*
+*.local
+
+# Local-only test fixtures (test.docx is a confidential real document)
+test.docx
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local state
+.claude/

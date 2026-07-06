@@ -10,7 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码
-COPY main.py .
+COPY main.py bridge.py ./
 
 # 暴露端口
 EXPOSE 1188
