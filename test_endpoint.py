@@ -244,3 +244,57 @@ class TestDeepLPassthrough:
             r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
         assert r.status_code == 200
         mock_deepl.assert_not_called()  # DeepL endpoint never hit
+
+    def test_deepl_html_raw_passthrough_no_extract_refill(self, client, monkeypatch):
+        # When DEEPL_API_KEY is set and tag_handling=html, the bridge must
+        # forward the RAW html string to DeepL (with tag_handling=html) and
+        # return DeepL's response text verbatim — NOT run its own
+        # extract_text_nodes / refill_text_nodes. DeepL's tag_handling does
+        # the structure preservation; we stay out of the way.
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        html_in = '<span style="font-weight:bold">hello</span><span>world</span>'
+        # DeepL returns the whole HTML back (structure preserved by DeepL)
+        deepl_out = '<span style="font-weight:bold">Hallo</span><span>Welt</span>'
+        captured = {}
+        def deepl_stub(payload):
+            captured["payload"] = payload
+            return {"translations": [{"detected_source_language": "EN", "text": deepl_out}]}
+
+        with patch("main._deepl_post", side_effect=deepl_stub):
+            r = client.post(
+                "/translate?tag_handling=html",
+                json={"text": html_in, "target_lang": "DE"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        # response is DeepL's verbatim output, not bridge-refilled
+        assert r.json()["translations"][0]["text"] == deepl_out
+        # DeepL received the RAW html (one text element), NOT extracted nodes
+        assert captured["payload"]["text"] == [html_in]
+        assert captured["payload"]["tag_handling"] == "html"
+
+    def test_deepl_html_raw_passthrough_falls_back_to_llm_on_failure(self, client, monkeypatch):
+        # If DeepL fails on raw passthrough, fall back to the LLM (which uses
+        # extract/refill). Don't leave the request untranslated if LLM can do it.
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        html_in = '<span style="font-weight:bold">hello</span>'
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=RuntimeError("DeepL 429")):
+            r = client.post(
+                "/translate?tag_handling=html",
+                json={"text": html_in, "target_lang": "EN"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        # LLM stub ran (its extract/refill output), DeepL was tried first
+        out = r.json()["translations"][0]["text"]
+        assert "olleh" in out  # stub reverses "hello"
+        assert 'style="font-weight:bold"' in out  # bridge preserved structure

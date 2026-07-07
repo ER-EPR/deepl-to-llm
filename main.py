@@ -260,6 +260,30 @@ def translate_items(texts: List[str], target_lang: str, target_lang_name: str,
     return out
 
 
+def deepl_translate_html_raw(html_str: str, target_lang: str) -> str:
+    """Forward a single raw HTML string to DeepL with tag_handling=html.
+
+    Bypasses the bridge's extract/refill entirely — DeepL's tag_handling=html
+    preserves the markup itself, and we return DeepL's response text verbatim.
+    Used for the HTML path when DEEPL_API_KEY is set, so the behavior matches
+    real DeepL as closely as possible (A/B testing). Raises on DeepL failure
+    so the caller can fall back to the LLM (extract/refill) path.
+    """
+    payload = {"text": [html_str], "target_lang": target_lang.upper(),
+               "tag_handling": "html", "split_sentences": "nonewlines"}
+    _log("debug", f"[DEEPL-RAW-REQ] target={target_lang} html_len={len(html_str)}")
+    t0 = time.time()
+    data = _deepl_post(payload)
+    elapsed = time.time() - t0
+    trans = data.get("translations", [])
+    if not trans:
+        raise RuntimeError("DeepL returned no translations")
+    out = str(trans[0].get("text", ""))
+    _log("debug", f"[DEEPL-RAW-RESP] {elapsed:.2f}s out_len={len(out)} "
+          f"out={_trunc(out)}")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -303,7 +327,20 @@ async def translate(request: Request, _=Depends(verify_token)):
     translations: List[str] = []
     for idx, text in enumerate(texts):
         if tag_handling == "html":
-            translated = bridge.translate_html(text, target_lang, translate_fn=route_translate)
+            # When DeepL is configured, forward the RAW html to DeepL
+            # (tag_handling=html) and return its output verbatim — bypassing
+            # the bridge's extract/refill so behavior matches real DeepL for
+            # A/B testing. On DeepL failure, fall back to the bridge (LLM).
+            if DEEPL_API_KEY:
+                try:
+                    translated = deepl_translate_html_raw(text, target_lang)
+                    _log("info", f"[BACKEND] DeepL(raw) served html[{idx}]")
+                except Exception as e:
+                    _log("info", f"[BACKEND] DeepL(raw) failed ({e}); "
+                         f"falling back to bridge")
+                    translated = bridge.translate_html(text, target_lang, translate_fn=route_translate)
+            else:
+                translated = bridge.translate_html(text, target_lang, translate_fn=route_translate)
         else:
             translated = bridge.translate_plain(text, target_lang, translate_fn=route_translate)
         _log("debug", f"[RESP] text[{idx}] -> {_trunc(translated)}")
