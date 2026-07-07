@@ -71,6 +71,20 @@ BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "")
 # network jitter between the bridge and Collabora.
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "8.5"))
 
+# DeepL passthrough (optional). If DEEPL_API_KEY is set, the bridge forwards
+# translation requests to the real DeepL API first, and falls back to the LLM
+# only on DeepL failure (429 rate-limit, 456 quota, connection error). This
+# allows A/B testing DeepL vs the LLM on the same Collabora document, and
+# keeps translating when DeepL quota runs out.
+# A free key ends in ":fx" -> use api-free.deepl.com; a Pro key -> api.deepl.com.
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
+DEEPL_API_URL = os.getenv(
+    "DEEPL_API_URL",
+    "https://api-free.deepl.com/v2/translate" if DEEPL_API_KEY.endswith(":fx")
+    else "https://api.deepl.com/v2/translate",
+)
+DEEPL_TIMEOUT = float(os.getenv("DEEPL_TIMEOUT", "9.0"))
+
 TRANSLATOR_SYSTEM_PROMPT = (
     "You are a professional translator. Translate each string in the JSON "
     'object {{"items": [...]}} into {target}. Output ONLY a JSON object with '
@@ -177,6 +191,75 @@ def llm_translate_items(texts: List[str], target_lang_name: str) -> List[str]:
     return out
 
 
+def _deepl_post(payload: dict) -> dict:
+    """Send a request to the DeepL API and return the parsed JSON.
+
+    Isolated in its own function so tests can patch THIS (not httpx.Client.post,
+    which would also break Starlette's TestClient transport). Raises on
+    rate-limit/quota/error so the router falls back to the LLM.
+    """
+    headers = {
+        "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=DEEPL_TIMEOUT) as client:
+        resp = client.post(DEEPL_API_URL, json=payload, headers=headers)
+    elapsed_note = ""  # logged by caller
+    # Stash elapsed for the caller to log if it wants.
+    if resp.status_code in (429, 456):
+        raise RuntimeError(f"DeepL {resp.status_code}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"DeepL {resp.status_code}: {_trunc(resp.text)}")
+    return resp.json()
+
+
+def deepl_translate_items(texts: List[str], target_lang: str, tag_handling: str) -> List[str]:
+    """Forward to the real DeepL API. Returns one translation per input, 1:1.
+
+    DeepL accepts `text` as an array and returns `translations` in the same
+    order. tag_handling=html is passed through so DeepL preserves markup the
+    same way the LLM path does. Raises on any DeepL failure so the caller can
+    fall back to the LLM.
+    """
+    if not texts:
+        return []
+    payload = {"text": texts, "target_lang": target_lang.upper()}
+    if tag_handling == "html":
+        payload["tag_handling"] = "html"
+        payload["split_sentences"] = "nonewlines"  # html mode default; explicit
+    _log("debug", f"[DEEPL-REQ] target={target_lang} tag={tag_handling} "
+         f"n_items={len(texts)}")
+    t0 = time.time()
+    data = _deepl_post(payload)
+    elapsed = time.time() - t0
+    trans = data.get("translations", [])
+    out = [str(t.get("text", "")) for t in trans]
+    if len(out) != len(texts):
+        _log("info", f"[DEEPL-RESP] COUNT MISMATCH: sent {len(texts)} got {len(out)}")
+    _log("debug", f"[DEEPL-RESP] {elapsed:.2f}s items={_trunc(json.dumps(out, ensure_ascii=False))}")
+    return out
+
+
+def translate_items(texts: List[str], target_lang: str, target_lang_name: str,
+                    tag_handling: str) -> List[str]:
+    """Route translation to DeepL (if configured) with LLM fallback.
+
+    DeepL first when DEEPL_API_KEY is set; on any DeepL failure (rate limit,
+    quota, network), fall back to the LLM. When no DeepL key is configured,
+    use the LLM directly. Logs which backend served the request.
+    """
+    if DEEPL_API_KEY:
+        try:
+            out = deepl_translate_items(texts, target_lang, tag_handling)
+            _log("info", f"[BACKEND] DeepL served {len(out)}/{len(texts)} items")
+            return out
+        except Exception as e:
+            _log("info", f"[BACKEND] DeepL failed ({e}); falling back to LLM")
+    out = llm_translate_items(texts, target_lang_name)
+    _log("info", f"[BACKEND] LLM served {len(out)}/{len(texts)} items")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -211,12 +294,18 @@ async def translate(request: Request, _=Depends(verify_token)):
 
     target_name = bridge.map_target_lang(target_lang)
 
+    # Build a translator that routes through DeepL (with LLM fallback). The
+    # bridge calls this per batch; it closes over this request's tag_handling
+    # and target_lang so DeepL gets the right parameters.
+    def route_translate(items, _target_name_ignored):
+        return translate_items(items, target_lang, target_name, tag_handling)
+
     translations: List[str] = []
     for idx, text in enumerate(texts):
         if tag_handling == "html":
-            translated = bridge.translate_html(text, target_lang)
+            translated = bridge.translate_html(text, target_lang, translate_fn=route_translate)
         else:
-            translated = bridge.translate_plain(text, target_lang)
+            translated = bridge.translate_plain(text, target_lang, translate_fn=route_translate)
         _log("debug", f"[RESP] text[{idx}] -> {_trunc(translated)}")
         translations.append(translated)
 

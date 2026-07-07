@@ -22,6 +22,9 @@ def _set_token(monkeypatch):
     # deterministic token for tests; auth is required when BRIDGE_TOKEN set
     monkeypatch.setenv("BRIDGE_TOKEN", "test-token-123")
     monkeypatch.setenv("LLM_API_KEY", "")  # stubbed anyway
+    # DeepL passthrough off by default; individual DeepL tests set it.
+    # Delenv raising=False so it's safe if a prior test set it.
+    monkeypatch.delenv("DEEPL_API_KEY", raising=False)
     # force reimport so env vars take effect
     import importlib, main
     importlib.reload(main)
@@ -151,3 +154,93 @@ class TestEndpointContract:
                 data={"text": "hi", "target_lang": "ZH", "auth_key": "test-token-123"},
             )
         assert r.status_code == 200
+
+
+class TestDeepLPassthrough:
+    """When DEEPL_API_KEY is set, the bridge forwards to real DeepL first and
+    falls back to the LLM only on DeepL failure (429 rate-limit, 456 quota,
+    connection error). This lets us A/B test DeepL vs LLM on the same
+    Collabora document, and keep translating when DeepL quota runs out.
+
+    The DeepL HTTP call is isolated in main._deepl_post, which we patch —
+    patching httpx.Client.post directly would also break Starlette's
+    TestClient transport.
+    """
+
+    def test_deepl_used_when_key_set(self, client, monkeypatch):
+        # set a DeepL key -> the router must call DeepL, not the LLM
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        # DeepL stub: returns one DE translation per input item, 1:1.
+        def deepl_stub(payload):
+            texts = payload["text"]
+            return {"translations": [
+                {"detected_source_language": "EN", "text": f"DE:{t}"}
+                for t in texts
+            ]}
+        llm_called = []
+        def llm_should_not_be_called(items, target):
+            llm_called.append(True)
+            return items
+
+        with patch("main.llm_translate_items", side_effect=llm_should_not_be_called), \
+             patch("main._deepl_post", side_effect=deepl_stub):
+            r = client.post("/translate", json={"text": ["hello", "world"], "target_lang": "DE"}, headers=AUTH)
+        assert r.status_code == 200
+        trans = r.json()["translations"]
+        assert [t["text"] for t in trans] == ["DE:hello", "DE:world"]
+        assert llm_called == []  # LLM was NOT used; DeepL served it
+
+    def test_falls_back_to_llm_on_deepl_429(self, client, monkeypatch):
+        # DeepL returns 429 (rate limited) -> bridge falls back to LLM
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=RuntimeError("DeepL 429")):
+            r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
+        assert r.status_code == 200
+        # LLM stub encodes its source reversed; confirms LLM was used
+        assert r.json()["translations"][0]["text"].startswith("[Chinese")
+
+    def test_falls_back_to_llm_on_deepl_456_quota(self, client, monkeypatch):
+        # 456 = DeepL quota exceeded -> fall back to LLM
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=RuntimeError("DeepL 456")):
+            r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
+        assert r.status_code == 200
+        assert r.json()["translations"][0]["text"].startswith("[Chinese")
+
+    def test_falls_back_to_llm_on_connection_error(self, client, monkeypatch):
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=ConnectionError("no route")):
+            r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
+        assert r.status_code == 200
+        assert r.json()["translations"][0]["text"].startswith("[Chinese")
+
+    def test_no_deepl_key_uses_llm_directly(self, client, monkeypatch):
+        # no DEEPL_API_KEY -> LLM path, DeepL never called
+        monkeypatch.delenv("DEEPL_API_KEY", raising=False)
+        import importlib, main
+        importlib.reload(main)
+
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post") as mock_deepl:
+            r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
+        assert r.status_code == 200
+        mock_deepl.assert_not_called()  # DeepL endpoint never hit
