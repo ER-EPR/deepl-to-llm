@@ -110,13 +110,16 @@ def llm_translate_items(texts: List[str], target_lang_name: str) -> List[str]:
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
-        # Disable Gemini "thinking". Translation is a deterministic task that
-        # needs no reasoning, and thinking adds ~2.5s plus scales poorly with
-        # payload size — directly causing Collabora's 10s hard timeout.
-        # thinkingBudget=0 is honored by gemini-2.5-flash and does NOT break
-        # JSON-structured output (verified live). This is passed through
-        # cliproxy's generationConfig passthrough to Gemini.
-        "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}},
+        # Gemini "thinking" budget. Translation needs a SMALL but NON-ZERO
+        # budget: with thinkingBudget=0 the model drops short/low-context
+        # fragments (e.g. a lone " 页" with a leading space) to empty strings,
+        # producing empty <span></span> — which in Collabora's whole-document
+        # loop cascades into runaway header/footer duplication. 512 is the
+        # minimum effective value (verified: 0/128 drop fragments, 512+ do
+        # not, 3/3 reproducible). Higher values add latency without quality
+        # gain. Real paragraphs finish in 3-4s at 512 — under Collabora's 10s.
+        # Passed through cliproxy's generationConfig passthrough to Gemini.
+        "generationConfig": {"thinkingConfig": {"thinkingBudget": 512}},
     }
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
