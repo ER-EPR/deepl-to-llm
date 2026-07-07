@@ -37,9 +37,12 @@ LLM_MODEL = os.getenv("LLM_MODEL", "")
 # use the endpoint) — always set it in production.
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "")
 
-# Collabora's libcurl client uses ~10s. Stay under it so the bridge responds
-# before Collabora times out and leaves a paragraph untranslated/empty.
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "9.0"))
+# Collabora's libcurl client uses a hardcoded 10s total timeout
+# (CURLOPT_TIMEOUT=10L in translate.cxx). Stay under it so the bridge
+# responds — or fails over to untranslated — before Collabora drops the
+# connection and leaves a paragraph half-translated. 8.5s leaves margin for
+# network jitter between the bridge and Collabora.
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "8.5"))
 
 TRANSLATOR_SYSTEM_PROMPT = (
     "You are a professional translator. Translate each string in the JSON "
@@ -107,6 +110,13 @@ def llm_translate_items(texts: List[str], target_lang_name: str) -> List[str]:
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
+        # Disable Gemini "thinking". Translation is a deterministic task that
+        # needs no reasoning, and thinking adds ~2.5s plus scales poorly with
+        # payload size — directly causing Collabora's 10s hard timeout.
+        # thinkingBudget=0 is honored by gemini-2.5-flash and does NOT break
+        # JSON-structured output (verified live). This is passed through
+        # cliproxy's generationConfig passthrough to Gemini.
+        "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}},
     }
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 

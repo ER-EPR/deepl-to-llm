@@ -191,22 +191,95 @@ def refill_text_nodes(html_str: str, translations: List[str]) -> str:
 # Type of the translator callable: takes (texts, target_lang_name) -> list[str].
 TranslateFn = Callable[[List[str], str], List[str]]
 
+# Per-batch safety-net limits. Context is prioritized: real Collabora
+# paragraphs are small (one or a few text nodes) and translate in 1-2.5s
+# with thinking disabled, so they must NEVER be split — splitting would
+# cost the cross-sentence context that makes LLM translation accurate.
+# These high thresholds only catch pathological payloads (e.g. a 150-span
+# table exported as a single fragment) that would otherwise exceed the
+# LLM/timeout budget. A real paragraph never reaches 5000 chars / 500 nodes.
+MAX_ITEMS_PER_BATCH = 500
+MAX_CHARS_PER_BATCH = 12000
+
+
+def batch_texts(
+    texts: List[str],
+    max_items: int = MAX_ITEMS_PER_BATCH,
+    max_chars: int = MAX_CHARS_PER_BATCH,
+) -> List[List[str]]:
+    """Split a list of text strings into sub-batches, as a SAFETY NET only.
+
+    Context is prioritized over fitting any time window: the thresholds are
+    deliberately high so normal paragraphs are never split (they translate in
+    1-2.5s with thinking disabled). Only pathological payloads — a single
+    HTML fragment with hundreds of text nodes — get split, and only because
+    a single call for them could exceed the LLM/timeout budget. A single text
+    larger than max_chars gets its own batch (it is NOT split mid-string).
+
+    Order is preserved end-to-end: flattening the returned batches reproduces
+    the input exactly.
+    """
+    if not texts:
+        return []
+    batches: List[List[str]] = []
+    current: List[str] = []
+    current_chars = 0
+    for t in texts:
+        item_chars = len(t)
+        would_overflow_items = len(current) >= max_items
+        would_overflow_chars = current and (current_chars + item_chars) > max_chars
+        if would_overflow_items or would_overflow_chars:
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(t)
+        current_chars += item_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _translate_batched(
+    texts: List[str],
+    target_lang_name: str,
+    translate_fn: TranslateFn,
+    max_items: int = MAX_ITEMS_PER_BATCH,
+    max_chars: int = MAX_CHARS_PER_BATCH,
+) -> List[str]:
+    """Translate a list of texts in sub-batches, concatenating results in order.
+
+    Raises on any batch failure so the caller can fall back to untranslated.
+    The thresholds default to the high safety-net values; callers may override
+    (tests use small values to force splitting).
+    """
+    out: List[str] = []
+    for batch in batch_texts(texts, max_items=max_items, max_chars=max_chars):
+        out.extend(translate_fn(batch, target_lang_name))
+    return out
+
 
 def translate_html(
     html_str: str,
     target_lang: str,
     translate_fn: Optional[TranslateFn] = None,
+    max_items: int = MAX_ITEMS_PER_BATCH,
+    max_chars: int = MAX_CHARS_PER_BATCH,
 ) -> str:
     """Translate an HTML fragment while preserving all markup.
 
     If translate_fn is None, the default LLM-backed translator is used
     (imported lazily so tests don't need network).
 
-    On any structural problem (translation count mismatch, parse failure),
-    returns the original html_str UNTRANSLATED. Returning the source
-    untouched is strictly better than returning corrupted markup: an
-    untranslated paragraph is a quality regression, a duplicated one is a
-    data-corruption incident.
+    The extracted text nodes are translated in sub-batches only as a SAFETY
+    NET (see batch_texts): normal paragraphs are a single call so their
+    context is preserved; only pathological payloads split. max_items/max_chars
+    override the high defaults for testing.
+
+    On any structural problem (translation count mismatch, parse failure,
+    any batch raising), returns the original html_str UNTRANSLATED.
+    Returning the source untouched is strictly better than returning corrupted
+    markup: an untranslated paragraph is a quality regression, a duplicated
+    one is a data-corruption incident.
     """
     try:
         texts = extract_text_nodes(html_str)
@@ -219,7 +292,10 @@ def translate_html(
         translate_fn = _default_llm_translate
 
     try:
-        translated = translate_fn(texts, map_target_lang(target_lang))
+        translated = _translate_batched(
+            texts, map_target_lang(target_lang), translate_fn,
+            max_items=max_items, max_chars=max_chars,
+        )
     except Exception:
         return html_str
 
@@ -241,7 +317,7 @@ def translate_plain(
     if translate_fn is None:
         translate_fn = _default_llm_translate
     try:
-        out = translate_fn([text], map_target_lang(target_lang))
+        out = _translate_batched([text], map_target_lang(target_lang), translate_fn)
     except Exception:
         return text
     if len(out) == 1:

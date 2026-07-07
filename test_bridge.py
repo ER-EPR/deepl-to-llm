@@ -162,3 +162,116 @@ class TestMapTargetLang:
     def test_lowercase_normalized(self):
         # DeepL codes are uppercase, but be defensive
         assert "English" in bridge.map_target_lang("en")
+
+
+# ---------------------------------------------------------------------------
+# batch_texts  (high-threshold safety net — context is prioritized)
+# ---------------------------------------------------------------------------
+
+class TestBatchTexts:
+    """batch_texts is a SAFETY NET, not a context-chopper. Real Collabora
+    paragraphs are small and translate in 1-2.5s with thinking disabled, so
+    they must NEVER be split — cross-sentence context is what makes LLM
+    translation accurate. Splitting only kicks in for pathological payloads
+    (hundreds of text nodes in one fragment) that could blow the budget.
+    Tests therefore pass EXPLICIT small thresholds to exercise the splitting
+    logic; the defaults (500 items / 12000 chars) leave normal input alone."""
+
+    def test_normal_paragraph_never_split_with_defaults(self):
+        # a realistic paragraph: a handful of items, well under default limits
+        texts = ["本条款规定医疗器械质量管理体系要求"] * 8
+        batches = bridge.batch_texts(texts)  # defaults: 500 items / 12000 chars
+        assert batches == [texts]  # one batch, context intact
+
+    def test_small_list_is_one_batch(self):
+        texts = ["a", "b", "c"]
+        batches = bridge.batch_texts(texts, max_items=60, max_chars=600)
+        assert batches == [["a", "b", "c"]]
+
+    def test_splits_by_max_items(self):
+        texts = [f"t{i}" for i in range(150)]
+        batches = bridge.batch_texts(texts, max_items=60, max_chars=100000)
+        # 150 / 60 -> 3 batches (60, 60, 30)
+        assert len(batches) == 3
+        assert sum(len(b) for b in batches) == 150
+        assert all(len(b) <= 60 for b in batches)
+
+    def test_splits_by_max_chars(self):
+        # each item 30 chars; max_chars=100 -> ~3 per batch
+        texts = [f"x{'.'*28}" for _ in range(10)]  # 10 items x 30 chars = 300
+        batches = bridge.batch_texts(texts, max_items=100, max_chars=100)
+        for b in batches:
+            assert sum(len(t) for t in b) <= 100
+        assert sum(len(b) for b in batches) == 10
+
+    def test_preserves_order_across_batches(self):
+        texts = [f"item{i}" for i in range(200)]
+        batches = bridge.batch_texts(texts, max_items=60, max_chars=100000)
+        flat = [t for b in batches for t in b]
+        assert flat == texts  # order preserved, nothing lost/duplicated
+
+    def test_single_huge_item_stays_in_own_batch(self):
+        # one item bigger than max_chars must not be dropped or split mid-string;
+        # it gets its own batch (translator handles it, or that batch times out
+        # and falls back — but batching must not corrupt it)
+        big = "x" * 5000
+        batches = bridge.batch_texts([big, "small"], max_items=60, max_chars=600)
+        assert batches[0] == [big]
+        assert batches[1] == ["small"]
+
+    def test_empty_input(self):
+        assert bridge.batch_texts([], max_items=60, max_chars=600) == []
+
+
+class TestBatchedTranslationContract:
+    """translate_html uses batch_texts as a safety net: a normal fragment is
+    one translator call (context preserved); only a pathological fragment
+    splits. Results reassemble in order. Any batch raising -> fall back to
+    the original HTML untranslated (no partial/corrupted output)."""
+
+    def test_normal_html_is_single_call_context_preserved(self):
+        # realistic paragraph -> one call, context not split
+        html_in = '<span>本条款规定医疗器械质量管理体系要求</span>'
+        calls = []
+        def recording_translate(texts, target_lang):
+            calls.append(list(texts))
+            return [f"T{t}" for t in texts]
+        bridge.translate_html(html_in, "EN", translate_fn=recording_translate)
+        assert len(calls) == 1  # context preserved, no splitting
+
+    def test_pathological_html_translated_in_batches_in_order(self):
+        # 150 spans -> splits, but result identical to a single call.
+        html_in = "".join(f"<span>n{i}</span>" for i in range(150))
+
+        calls = []
+        def recording_translate(texts, target_lang):
+            calls.append(list(texts))
+            return [f"T{t}" for t in texts]
+
+        out = bridge.translate_html(
+            html_in, "EN", translate_fn=recording_translate,
+            max_items=60, max_chars=100000,  # force split for this test
+        )
+        assert len(calls) > 1  # multiple batches
+        total = sum(len(c) for c in calls)
+        assert total == 150
+        for i in range(150):
+            assert f"Tn{i}" in out
+        assert out.count("<span") == 150
+
+    def test_batch_failure_falls_back_to_original(self):
+        # if any sub-batch translator call raises, the whole fragment falls
+        # back to untranslated (no partial/corrupted output). Fail on the
+        # 2nd batch onward; force splitting with explicit small thresholds.
+        html_in = "".join(f"<span>n{i}</span>" for i in range(150))
+        call_count = {"n": 0}
+        def failing_translate(texts, target_lang):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:  # 2nd batch onward raises
+                raise RuntimeError("timeout")
+            return [f"T{t}" for t in texts]
+        out = bridge.translate_html(
+            html_in, "EN", translate_fn=failing_translate,
+            max_items=60, max_chars=100000,
+        )
+        assert out == html_in  # unchanged, safe
