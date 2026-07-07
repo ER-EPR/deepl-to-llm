@@ -105,7 +105,7 @@ b65cb2f Replace hardcoded secrets with placeholders
 ```yaml
 environment:
   - LLM_API_URL=https://example.com/v1/chat/completions
-  - LLM_API_KEY=<your-llm-key>
+  - LLM_API_KEY=<your LLM key>
   - LLM_MODEL=gemini-2.5-flash
   - BRIDGE_TOKEN=<设置，否则鉴权关闭>
   - DEEPL_API_KEY=<DeepL free key，:fx 结尾>   # 可选，设了就 DeepL 优先
