@@ -104,7 +104,7 @@ b65cb2f Replace hardcoded secrets with placeholders
 
 ```yaml
 environment:
-  - LLM_API_URL=https://example.com/v1/chat/completions
+  - LLM_API_URL=<your LLM chat-completions URL>
   - LLM_API_KEY=<your LLM key>
   - LLM_MODEL=gemini-2.5-flash
   - BRIDGE_TOKEN=<设置，否则鉴权关闭>
