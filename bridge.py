@@ -20,9 +20,35 @@ Public API:
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Callable, List, Optional
 
 from lxml import etree, html as lxml_html
+
+
+def _blog(level: str, msg: str) -> None:
+    """Log to stderr if LOG_LEVEL permits. Mirrors main._log.
+
+    Levels: debug < info < off. LOG_LEVEL=debug shows everything; info (or
+    unset) shows warnings/fallbacks; anything else is silent. Goes to stderr
+    so docker logs captures it.
+    """
+    cfg = os.getenv("LOG_LEVEL", "info").lower()
+    levels = {"debug": 0, "info": 1}
+    if cfg not in levels:
+        return
+    if levels.get(level, 99) < levels[cfg]:
+        return
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _btrunc(s: str, n: int = 800) -> str:
+    if s is None:
+        return "<None>"
+    if len(s) <= n:
+        return s
+    return f"{s[:n//2]}…[{len(s)} chars]…{s[-n//4:]}"
 
 # DeepL language codes -> human-readable name for the LLM prompt.
 # DeepL accepts uppercase codes like ZH, EN-US, ZH-HANS. The LLM translates
@@ -283,8 +309,11 @@ def translate_html(
     """
     try:
         texts = extract_text_nodes(html_str)
-    except Exception:
+    except Exception as e:
+        _blog("info", f"[HTML] parse failed: {e!r}; html={_btrunc(html_str)}")
         return html_str
+    _blog("debug", f"[HTML] extracted {len(texts)} nodes from "
+          f"{_btrunc(html_str)}: {_btrunc(repr(texts))}")
     if not texts:
         return html_str
 
@@ -296,15 +325,21 @@ def translate_html(
             texts, map_target_lang(target_lang), translate_fn,
             max_items=max_items, max_chars=max_chars,
         )
-    except Exception:
+    except Exception as e:
+        _blog("info", f"[HTML] translate_fn raised: {e!r}; falling back to original")
         return html_str
 
     if len(translated) != len(texts):
+        _blog("info", f"[HTML] count mismatch: extracted {len(texts)} "
+              f"got {len(translated)}; falling back to original")
         return html_str
 
     try:
-        return refill_text_nodes(html_str, translated)
-    except Exception:
+        out = refill_text_nodes(html_str, translated)
+        _blog("debug", f"[HTML] refilled OK: {_btrunc(out)}")
+        return out
+    except Exception as e:
+        _blog("info", f"[HTML] refill failed: {e!r}; falling back to original")
         return html_str
 
 

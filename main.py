@@ -16,6 +16,8 @@ header/footer duplication (Bug 1) and lost run formatting (Bug 2).
 """
 import json
 import os
+import sys
+import time
 from typing import List, Optional
 
 import httpx
@@ -24,6 +26,31 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 import bridge
 
 app = FastAPI()
+
+
+def _log(level: str, msg: str) -> None:
+    """Log to stderr if LOG_LEVEL permits. Levels: DEBUG < INFO < (off).
+
+    LOG_LEVEL=debug -> everything; LOG_LEVEL=info (or unset) -> info+;
+    any other value (e.g. "off") -> nothing. Goes to stderr so docker logs
+    captures it.
+    """
+    cfg = os.getenv("LOG_LEVEL", "info").lower()
+    levels = {"debug": 0, "info": 1}
+    if cfg not in levels:
+        return  # off
+    if levels.get(level, 99) < levels[cfg]:
+        return
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _trunc(s: str, n: int = 800) -> str:
+    """Truncate a string for logging, showing head + tail + length."""
+    if s is None:
+        return "<None>"
+    if len(s) <= n:
+        return s
+    return f"{s[:n//2]}…[{len(s)} chars]…{s[-n//4:]}"
 
 # Config is read at import time (module-level constants -> restart to change).
 # All of these MUST be set via environment variables (e.g. in docker-compose);
@@ -123,17 +150,31 @@ def llm_translate_items(texts: List[str], target_lang_name: str) -> List[str]:
     }
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
+    _log("debug", f"[LLM-REQ] target={target_lang_name} n_items={len(texts)} "
+         f"items={_trunc(json.dumps(texts, ensure_ascii=False))}")
+    t0 = time.time()
     with httpx.Client(timeout=LLM_TIMEOUT) as client:
         resp = client.post(LLM_API_URL, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+    elapsed = time.time() - t0
 
     content = data["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-    items = parsed.get("items")
+    _log("debug", f"[LLM-RESP] {elapsed:.2f}s content={_trunc(content)}")
+    try:
+        parsed = json.loads(content)
+        items = parsed.get("items")
+    except Exception as e:
+        _log("info", f"[LLM-RESP] JSON parse failed: {e}; raw={_trunc(content)}")
+        raise
     if not isinstance(items, list):
+        _log("info", f"[LLM-RESP] 'items' not a list: {type(items).__name__}")
         raise ValueError("LLM response missing 'items' list")
-    return [str(x) for x in items]
+    out = [str(x) for x in items]
+    if len(out) != len(texts):
+        _log("info", f"[LLM-RESP] COUNT MISMATCH: sent {len(texts)} got {len(out)}")
+    _log("debug", f"[LLM-RESP] parsed items={_trunc(json.dumps(out, ensure_ascii=False))}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -163,14 +204,20 @@ async def translate(request: Request, _=Depends(verify_token)):
     else:
         texts = [str(text_data)]
 
+    _log("debug", f"[REQ] tag_handling={tag_handling} target_lang={target_lang} "
+         f"n_texts={len(texts)}")
+    for i, t in enumerate(texts):
+        _log("debug", f"[REQ] text[{i}]={_trunc(t)}")
+
     target_name = bridge.map_target_lang(target_lang)
 
     translations: List[str] = []
-    for text in texts:
+    for idx, text in enumerate(texts):
         if tag_handling == "html":
             translated = bridge.translate_html(text, target_lang)
         else:
             translated = bridge.translate_plain(text, target_lang)
+        _log("debug", f"[RESP] text[{idx}] -> {_trunc(translated)}")
         translations.append(translated)
 
     return {
